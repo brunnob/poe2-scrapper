@@ -1,20 +1,25 @@
 '*******************************************************************************
 ' POE2 Scout Price Scraper for Excel
-' Version: 3.1.0
+' Version: 3.2.0
 ' Description: Fetch real-time POE2 item prices with auto-refresh support
 ' Author: POE2 Community
 ' License: MIT
 ' Data Source: https://poe2scout.com
 '
-' NEW IN v3.1 (correct API mapping):
+' NEW IN v3.2 (season 0.5 fixes):
+' - Default league updated to "Runes of Aldur" (season 0.5)
+' - Parser now tolerant of BOTH snake_case and camelCase field names.
+'   The 0.5 API serializes fields in camelCase (currentPrice, categoryApiId,
+'   apiId, itemId, iconUrl) which made the fallback parser return empty
+'   values for every item. Extraction now tries multiple key spellings.
+' - All public function signatures preserved
+'
+' From v3.1 (correct API mapping):
 ' - Correct endpoint: /api/poe2/Leagues/{league}/Items (single aggregated list)
 ' - No pagination, no Page/PerPage params (these caused HTTP 422)
 ' - Response is a plain JSON array (not a paginated envelope)
-' - Field names are snake_case: text, current_price, category_api_id,
-'   name, type, api_id, icon_url, item_id
 ' - Categories endpoint: /api/poe2/Leagues/{league}/Items/Categories
 ' - Retry with backoff on HTTP 429 (rate limit)
-' - All public function signatures preserved
 '*******************************************************************************
 
 Option Explicit
@@ -31,7 +36,7 @@ Private Const API_BASE As String = "https://poe2scout.com/api/poe2/Leagues/"
 
 Public Function getPOE2Price(ByVal itemName As String, _
                              Optional ByVal category As String = "", _
-                             Optional ByVal league As String = "Fate of the Vaal") As Variant
+                             Optional ByVal league As String = "Runes of Aldur") As Variant
     On Error GoTo ErrorHandler
 
     If Trim(itemName) = "" Then
@@ -68,7 +73,7 @@ End Function
 
 Public Function getPOE2ItemDetails(ByVal itemName As String, _
                                    Optional ByVal category As String = "", _
-                                   Optional ByVal league As String = "Fate of the Vaal") As Variant
+                                   Optional ByVal league As String = "Runes of Aldur") As Variant
     On Error GoTo ErrorHandler
 
     If Trim(itemName) = "" Then
@@ -106,7 +111,7 @@ ErrorHandler:
 End Function
 
 Public Function getPOE2Items(Optional ByVal category As String = "", _
-                             Optional ByVal league As String = "Fate of the Vaal") As Variant
+                             Optional ByVal league As String = "Runes of Aldur") As Variant
     On Error GoTo ErrorHandler
 
     Dim data As Collection
@@ -152,7 +157,7 @@ ErrorHandler:
     getPOE2Items = Array(Array("Error", Err.Description, "", ""))
 End Function
 
-Public Function getPOE2Categories(Optional ByVal league As String = "Fate of the Vaal") As Variant
+Public Function getPOE2Categories(Optional ByVal league As String = "Runes of Aldur") As Variant
     On Error GoTo ErrorHandler
 
     Dim data As Collection
@@ -202,35 +207,35 @@ End Function
 ' QUICK CATEGORY FUNCTIONS
 '*******************************************************************************
 
-Public Function getPOE2Currency(Optional ByVal league As String = "Fate of the Vaal") As Variant
+Public Function getPOE2Currency(Optional ByVal league As String = "Runes of Aldur") As Variant
     getPOE2Currency = getPOE2Items("currency", league)
 End Function
 
-Public Function getPOE2Fragments(Optional ByVal league As String = "Fate of the Vaal") As Variant
+Public Function getPOE2Fragments(Optional ByVal league As String = "Runes of Aldur") As Variant
     getPOE2Fragments = getPOE2Items("fragments", league)
 End Function
 
-Public Function getPOE2Runes(Optional ByVal league As String = "Fate of the Vaal") As Variant
+Public Function getPOE2Runes(Optional ByVal league As String = "Runes of Aldur") As Variant
     getPOE2Runes = getPOE2Items("runes", league)
 End Function
 
-Public Function getPOE2Talismans(Optional ByVal league As String = "Fate of the Vaal") As Variant
+Public Function getPOE2Talismans(Optional ByVal league As String = "Runes of Aldur") As Variant
     getPOE2Talismans = getPOE2Items("talismans", league)
 End Function
 
-Public Function getPOE2Essences(Optional ByVal league As String = "Fate of the Vaal") As Variant
+Public Function getPOE2Essences(Optional ByVal league As String = "Runes of Aldur") As Variant
     getPOE2Essences = getPOE2Items("essences", league)
 End Function
 
-Public Function getPOE2Accessories(Optional ByVal league As String = "Fate of the Vaal") As Variant
+Public Function getPOE2Accessories(Optional ByVal league As String = "Runes of Aldur") As Variant
     getPOE2Accessories = getPOE2Items("accessory", league)
 End Function
 
-Public Function getPOE2Armour(Optional ByVal league As String = "Fate of the Vaal") As Variant
+Public Function getPOE2Armour(Optional ByVal league As String = "Runes of Aldur") As Variant
     getPOE2Armour = getPOE2Items("armour", league)
 End Function
 
-Public Function getPOE2Weapons(Optional ByVal league As String = "Fate of the Vaal") As Variant
+Public Function getPOE2Weapons(Optional ByVal league As String = "Runes of Aldur") As Variant
     getPOE2Weapons = getPOE2Items("weapon", league)
 End Function
 
@@ -440,19 +445,46 @@ Private Function ConvertJSObject(ByVal jsObj As Object) As Object
     Dim dict As Object
     Set dict = CreateObject("Scripting.Dictionary")
 
-    On Error Resume Next
-    dict.Add "item_id", CStr(jsObj.item_id)
-    dict.Add "api_id", CStr(jsObj.api_id)
-    dict.Add "text", CStr(jsObj.text)
-    dict.Add "name", CStr(jsObj.name)
-    dict.Add "type", CStr(jsObj.type)
-    dict.Add "category_api_id", CStr(jsObj.category_api_id)
-    dict.Add "current_price", CStr(jsObj.current_price)
-    dict.Add "icon_url", CStr(jsObj.icon_url)
-    On Error GoTo 0
+    ' Populate canonical snake_case keys, reading from whichever spelling
+    ' the API used (snake_case in older seasons, camelCase in 0.5).
+    SetJSField dict, jsObj, "item_id", Array("item_id", "itemId", "id")
+    SetJSField dict, jsObj, "api_id", Array("api_id", "apiId")
+    SetJSField dict, jsObj, "text", Array("text")
+    SetJSField dict, jsObj, "name", Array("name")
+    SetJSField dict, jsObj, "type", Array("type")
+    SetJSField dict, jsObj, "category_api_id", Array("category_api_id", "categoryApiId", "category")
+    SetJSField dict, jsObj, "current_price", Array("current_price", "currentPrice", "price")
+    SetJSField dict, jsObj, "icon_url", Array("icon_url", "iconUrl")
+    SetJSField dict, jsObj, "current_quantity", Array("current_quantity", "currentQuantity", "quantity")
 
     Set ConvertJSObject = dict
 End Function
+
+' Reads the first available property (by any candidate name) from a JScript
+' object and stores it in the dictionary under the canonical key.
+Private Sub SetJSField(ByVal dict As Object, ByVal jsObj As Object, _
+                       ByVal canonicalKey As String, ByVal candidates As Variant)
+    Dim k As Long
+    Dim val As Variant
+    Dim got As Boolean
+    got = False
+
+    For k = LBound(candidates) To UBound(candidates)
+        On Error Resume Next
+        Err.Clear
+        val = CallByName(jsObj, candidates(k), VbGet)
+        If Err.Number = 0 Then
+            If Not IsNull(val) And Not IsEmpty(val) Then
+                dict(canonicalKey) = CStr(val)
+                got = True
+                Exit For
+            End If
+        End If
+        On Error GoTo 0
+    Next k
+
+    If Not got Then dict(canonicalKey) = ""
+End Sub
 
 '*******************************************************************************
 ' FALLBACK JSON PARSER (PRIVATE) - used if MSScriptControl is unavailable
@@ -521,13 +553,16 @@ Private Function ParseJSONObject(ByVal jsonText As String) As Object
     Dim dict As Object
     Set dict = CreateObject("Scripting.Dictionary")
 
+    ' The 0.5 API serializes in camelCase; older data was snake_case.
+    ' Try every known spelling for each logical field.
     dict.Add "text", ExtractJSONValue(jsonText, "text")
-    dict.Add "current_price", ExtractJSONValue(jsonText, "current_price")
-    dict.Add "category_api_id", ExtractJSONValue(jsonText, "category_api_id")
+    dict.Add "current_price", ExtractJSONValue(jsonText, "current_price,currentPrice,price")
+    dict.Add "category_api_id", ExtractJSONValue(jsonText, "category_api_id,categoryApiId,category")
     dict.Add "name", ExtractJSONValue(jsonText, "name")
     dict.Add "type", ExtractJSONValue(jsonText, "type")
-    dict.Add "api_id", ExtractJSONValue(jsonText, "api_id")
-    dict.Add "item_id", ExtractJSONValue(jsonText, "item_id")
+    dict.Add "api_id", ExtractJSONValue(jsonText, "api_id,apiId")
+    dict.Add "item_id", ExtractJSONValue(jsonText, "item_id,itemId,id")
+    dict.Add "current_quantity", ExtractJSONValue(jsonText, "current_quantity,currentQuantity,quantity")
 
     If Err.Number <> 0 Then
         Set ParseJSONObject = Nothing
@@ -536,20 +571,38 @@ Private Function ParseJSONObject(ByVal jsonText As String) As Object
     End If
 End Function
 
+' key may be a single key or a comma-separated list of candidate keys.
+' The first candidate that is present in jsonText wins. Matching is
+' case-insensitive so snake_case and camelCase both resolve.
 Private Function ExtractJSONValue(ByVal jsonText As String, ByVal key As String) As String
     On Error Resume Next
 
-    Dim pattern As String
-    pattern = """" & key & """:"
+    Dim candidates() As String
+    candidates = Split(key, ",")
 
     Dim startPos As Long
-    startPos = InStr(jsonText, pattern)
+    Dim pattern As String
+    Dim k As Long
+    Dim matchLen As Long
+    Dim lowerJson As String
+    lowerJson = LCase(jsonText)
+
+    startPos = 0
+    For k = 0 To UBound(candidates)
+        pattern = """" & Trim(candidates(k)) & """:"
+        startPos = InStr(lowerJson, LCase(pattern))
+        If startPos > 0 Then
+            matchLen = Len(pattern)
+            Exit For
+        End If
+    Next k
+
     If startPos = 0 Then
         ExtractJSONValue = ""
         Exit Function
     End If
 
-    startPos = startPos + Len(pattern)
+    startPos = startPos + matchLen
     Do While Mid(jsonText, startPos, 1) = " "
         startPos = startPos + 1
     Loop
@@ -786,12 +839,28 @@ Public Sub ClearCache()
     Debug.Print "Cache cleared at " & Now
 End Sub
 
+' Diagnostic: prints the first 800 chars of the raw API response so the
+' actual JSON field names can be confirmed.
+Public Sub DumpRawResponse()
+    Dim url As String
+    url = API_BASE & URLEncode("Runes of Aldur") & "/Items"
+
+    Dim raw As String
+    raw = HttpGetWithRetry(url)
+
+    Debug.Print "URL: " & url
+    Debug.Print "Length: " & Len(raw)
+    Debug.Print "--- First 800 chars ---"
+    Debug.Print Left(raw, 800)
+    Debug.Print "-----------------------"
+End Sub
+
 Public Sub TestAPIConnection()
-    Debug.Print "Testing API connection (v3.1.0)..."
+    Debug.Print "Testing API connection (v3.2.0)..."
     ClearCache
 
     Dim data As Collection
-    Set data = FetchPOE2Data("Fate of the Vaal")
+    Set data = FetchPOE2Data("Runes of Aldur")
 
     If data Is Nothing Then
         Debug.Print "FAILED: Could not fetch data"
