@@ -1,28 +1,30 @@
 '*******************************************************************************
 ' POE2 Scout Price Scraper for Excel
-' Version: 3.3.0
+' Version: 3.4.0
 ' Description: Fetch real-time POE2 item prices with auto-refresh support
 ' Author: POE2 Community
 ' License: MIT
 ' Data Source: https://poe2scout.com
 '
-' NEW IN v3.3 (auto-detect active league):
-' - Active league is now fetched automatically from the API on first call.
-'   No code change needed when a new season launches.
-' - Pass league="" (or omit the argument) to always use the current league.
-' - League name is cached for 60 minutes to avoid extra requests.
-' - GetActiveLeague() public function returns the current league name.
+' NEW IN v3.4 (no auto-recalculation):
+' - Functions NEVER recalculate automatically during normal spreadsheet use.
+'   Results are frozen after the first fetch and only update when the user
+'   explicitly runs a refresh macro (AtualizarPrecos / ForcarAtualizacao).
+' - Achieved via a result-level cache keyed by function name + arguments.
+'   Excel may call the UDF on every recalc but it returns instantly from
+'   memory without iterating data or hitting the network.
+' - Application.Volatile False is set explicitly on every public function.
+'
+' From v3.3 (auto-detect active league):
+' - GetActiveLeague() fetches current league from API, cached 60 minutes
 '
 ' From v3.2 (season 0.5 fixes):
-' - Default league updated to "Runes of Aldur" (season 0.5)
 ' - Parser tolerant of both snake_case and camelCase field names
 '
 ' From v3.1 (correct API mapping):
-' - Correct endpoint: /api/poe2/Leagues/{league}/Items (single aggregated list)
-' - No pagination, no Page/PerPage params (these caused HTTP 422)
-' - Response is a plain JSON array (not a paginated envelope)
-' - Categories endpoint: /api/poe2/Leagues/{league}/Items/Categories
-' - Retry with backoff on HTTP 429 (rate limit)
+' - Correct endpoint: /api/poe2/Leagues/{league}/Items
+' - No pagination params, plain JSON array response
+' - Retry with backoff on HTTP 429
 '*******************************************************************************
 
 Option Explicit
@@ -37,6 +39,10 @@ Private cachedActiveleague As String
 Private activeLeagueTimestamp As Date
 Private Const LEAGUE_CACHE_MINUTES As Integer = 60
 
+' Result-level cache: stores final return values keyed by "func|args".
+' Functions return instantly from here on every recalc after first fetch.
+Private resultCache As Object
+
 '*******************************************************************************
 ' PUBLIC FUNCTIONS
 '*******************************************************************************
@@ -44,7 +50,15 @@ Private Const LEAGUE_CACHE_MINUTES As Integer = 60
 Public Function getPOE2Price(ByVal itemName As String, _
                              Optional ByVal category As String = "", _
                              Optional ByVal league As String = "") As Variant
+    Application.Volatile False
     On Error GoTo ErrorHandler
+
+    Dim cacheKey As String
+    cacheKey = "price|" & LCase(itemName) & "|" & LCase(category) & "|" & LCase(league)
+    If ResultCacheHas(cacheKey) Then
+        getPOE2Price = ResultCacheGet(cacheKey)
+        Exit Function
+    End If
 
     If Trim(itemName) = "" Then
         getPOE2Price = "Error: Item name required"
@@ -65,14 +79,18 @@ Public Function getPOE2Price(ByVal itemName As String, _
     Dim foundItem As Object
     Set foundItem = FindItem(items, itemName)
 
+    Dim result As Variant
     If foundItem Is Nothing Then
-        getPOE2Price = "Error: Item '" & itemName & "' not found"
+        result = "Error: Item '" & itemName & "' not found"
     Else
         On Error Resume Next
-        getPOE2Price = ParseNumberFromJSON(GetDictValue(foundItem, "current_price", "0"))
-        If Err.Number <> 0 Then getPOE2Price = "Error: Invalid price data"
+        result = ParseNumberFromJSON(GetDictValue(foundItem, "current_price", "0"))
+        If Err.Number <> 0 Then result = "Error: Invalid price data"
         On Error GoTo ErrorHandler
     End If
+
+    ResultCacheSet cacheKey, result
+    getPOE2Price = result
     Exit Function
 ErrorHandler:
     getPOE2Price = "Error: " & Err.Description & " (Code: " & Err.Number & ")"
@@ -81,7 +99,15 @@ End Function
 Public Function getPOE2ItemDetails(ByVal itemName As String, _
                                    Optional ByVal category As String = "", _
                                    Optional ByVal league As String = "") As Variant
+    Application.Volatile False
     On Error GoTo ErrorHandler
+
+    Dim cacheKey As String
+    cacheKey = "details|" & LCase(itemName) & "|" & LCase(category) & "|" & LCase(league)
+    If ResultCacheHas(cacheKey) Then
+        getPOE2ItemDetails = ResultCacheGet(cacheKey)
+        Exit Function
+    End If
 
     If Trim(itemName) = "" Then
         getPOE2ItemDetails = Array("Error", "Item name required", "", "")
@@ -102,16 +128,21 @@ Public Function getPOE2ItemDetails(ByVal itemName As String, _
     Dim foundItem As Object
     Set foundItem = FindItem(items, itemName)
 
+    Dim result(0 To 3) As Variant
     If foundItem Is Nothing Then
-        getPOE2ItemDetails = Array("Error", "Item not found", "", "")
+        result(0) = "Error"
+        result(1) = "Item not found"
+        result(2) = ""
+        result(3) = ""
     Else
-        Dim result(0 To 3) As Variant
         result(0) = GetDictValue(foundItem, "text", "Unknown")
         result(1) = ParseNumberFromJSON(GetDictValue(foundItem, "current_price", "0"))
         result(2) = GetQuantity(foundItem)
         result(3) = GetDictValue(foundItem, "category_api_id", "Unknown")
-        getPOE2ItemDetails = result
     End If
+
+    ResultCacheSet cacheKey, result
+    getPOE2ItemDetails = result
     Exit Function
 ErrorHandler:
     getPOE2ItemDetails = Array("Error", Err.Description, "", "")
@@ -119,7 +150,15 @@ End Function
 
 Public Function getPOE2Items(Optional ByVal category As String = "", _
                              Optional ByVal league As String = "") As Variant
+    Application.Volatile False
     On Error GoTo ErrorHandler
+
+    Dim cacheKey As String
+    cacheKey = "items|" & LCase(category) & "|" & LCase(league)
+    If ResultCacheHas(cacheKey) Then
+        getPOE2Items = ResultCacheGet(cacheKey)
+        Exit Function
+    End If
 
     Dim data As Collection
     Set data = FetchPOE2Data(league)
@@ -158,6 +197,7 @@ Public Function getPOE2Items(Optional ByVal category As String = "", _
         result(i, 3) = GetDictValue(item, "category_api_id", "Unknown")
     Next i
 
+    ResultCacheSet cacheKey, result
     getPOE2Items = result
     Exit Function
 ErrorHandler:
@@ -165,7 +205,15 @@ ErrorHandler:
 End Function
 
 Public Function getPOE2Categories(Optional ByVal league As String = "") As Variant
+    Application.Volatile False
     On Error GoTo ErrorHandler
+
+    Dim cacheKey As String
+    cacheKey = "categories|" & LCase(league)
+    If ResultCacheHas(cacheKey) Then
+        getPOE2Categories = ResultCacheGet(cacheKey)
+        Exit Function
+    End If
 
     Dim data As Collection
     Set data = FetchPOE2Data(league)
@@ -204,6 +252,7 @@ Public Function getPOE2Categories(Optional ByVal league As String = "") As Varia
         result(i + 1, 1) = categoryCounts(keys(i))
     Next i
 
+    ResultCacheSet cacheKey, result
     getPOE2Categories = result
     Exit Function
 ErrorHandler:
@@ -883,7 +932,29 @@ Public Sub ClearCache()
     cacheTimestamp = 0
     cachedActiveleague = ""
     activeLeagueTimestamp = 0
+    Set resultCache = Nothing
     Debug.Print "Cache cleared at " & Now
+End Sub
+
+'*******************************************************************************
+' RESULT CACHE HELPERS (PRIVATE)
+'*******************************************************************************
+
+Private Function ResultCacheHas(ByVal key As String) As Boolean
+    If resultCache Is Nothing Then
+        ResultCacheHas = False
+    Else
+        ResultCacheHas = resultCache.Exists(key)
+    End If
+End Function
+
+Private Function ResultCacheGet(ByVal key As String) As Variant
+    ResultCacheGet = resultCache(key)
+End Function
+
+Private Sub ResultCacheSet(ByVal key As String, ByVal value As Variant)
+    If resultCache Is Nothing Then Set resultCache = CreateObject("Scripting.Dictionary")
+    resultCache(key) = value
 End Sub
 
 ' Diagnostic: prints the first 800 chars of the raw API response so the
