@@ -1,18 +1,21 @@
 '*******************************************************************************
 ' POE2 Scout Price Scraper for Excel
-' Version: 3.2.0
+' Version: 3.3.0
 ' Description: Fetch real-time POE2 item prices with auto-refresh support
 ' Author: POE2 Community
 ' License: MIT
 ' Data Source: https://poe2scout.com
 '
-' NEW IN v3.2 (season 0.5 fixes):
+' NEW IN v3.3 (auto-detect active league):
+' - Active league is now fetched automatically from the API on first call.
+'   No code change needed when a new season launches.
+' - Pass league="" (or omit the argument) to always use the current league.
+' - League name is cached for 60 minutes to avoid extra requests.
+' - GetActiveLeague() public function returns the current league name.
+'
+' From v3.2 (season 0.5 fixes):
 ' - Default league updated to "Runes of Aldur" (season 0.5)
-' - Parser now tolerant of BOTH snake_case and camelCase field names.
-'   The 0.5 API serializes fields in camelCase (currentPrice, categoryApiId,
-'   apiId, itemId, iconUrl) which made the fallback parser return empty
-'   values for every item. Extraction now tries multiple key spellings.
-' - All public function signatures preserved
+' - Parser tolerant of both snake_case and camelCase field names
 '
 ' From v3.1 (correct API mapping):
 ' - Correct endpoint: /api/poe2/Leagues/{league}/Items (single aggregated list)
@@ -30,13 +33,17 @@ Private cacheTimestamp As Date
 Private Const CACHE_DURATION_MINUTES As Integer = 5
 Private Const API_BASE As String = "https://poe2scout.com/api/poe2/Leagues/"
 
+Private cachedActiveleague As String
+Private activeLeagueTimestamp As Date
+Private Const LEAGUE_CACHE_MINUTES As Integer = 60
+
 '*******************************************************************************
 ' PUBLIC FUNCTIONS
 '*******************************************************************************
 
 Public Function getPOE2Price(ByVal itemName As String, _
                              Optional ByVal category As String = "", _
-                             Optional ByVal league As String = "Runes of Aldur") As Variant
+                             Optional ByVal league As String = "") As Variant
     On Error GoTo ErrorHandler
 
     If Trim(itemName) = "" Then
@@ -73,7 +80,7 @@ End Function
 
 Public Function getPOE2ItemDetails(ByVal itemName As String, _
                                    Optional ByVal category As String = "", _
-                                   Optional ByVal league As String = "Runes of Aldur") As Variant
+                                   Optional ByVal league As String = "") As Variant
     On Error GoTo ErrorHandler
 
     If Trim(itemName) = "" Then
@@ -111,7 +118,7 @@ ErrorHandler:
 End Function
 
 Public Function getPOE2Items(Optional ByVal category As String = "", _
-                             Optional ByVal league As String = "Runes of Aldur") As Variant
+                             Optional ByVal league As String = "") As Variant
     On Error GoTo ErrorHandler
 
     Dim data As Collection
@@ -157,7 +164,7 @@ ErrorHandler:
     getPOE2Items = Array(Array("Error", Err.Description, "", ""))
 End Function
 
-Public Function getPOE2Categories(Optional ByVal league As String = "Runes of Aldur") As Variant
+Public Function getPOE2Categories(Optional ByVal league As String = "") As Variant
     On Error GoTo ErrorHandler
 
     Dim data As Collection
@@ -207,35 +214,35 @@ End Function
 ' QUICK CATEGORY FUNCTIONS
 '*******************************************************************************
 
-Public Function getPOE2Currency(Optional ByVal league As String = "Runes of Aldur") As Variant
+Public Function getPOE2Currency(Optional ByVal league As String = "") As Variant
     getPOE2Currency = getPOE2Items("currency", league)
 End Function
 
-Public Function getPOE2Fragments(Optional ByVal league As String = "Runes of Aldur") As Variant
+Public Function getPOE2Fragments(Optional ByVal league As String = "") As Variant
     getPOE2Fragments = getPOE2Items("fragments", league)
 End Function
 
-Public Function getPOE2Runes(Optional ByVal league As String = "Runes of Aldur") As Variant
+Public Function getPOE2Runes(Optional ByVal league As String = "") As Variant
     getPOE2Runes = getPOE2Items("runes", league)
 End Function
 
-Public Function getPOE2Talismans(Optional ByVal league As String = "Runes of Aldur") As Variant
+Public Function getPOE2Talismans(Optional ByVal league As String = "") As Variant
     getPOE2Talismans = getPOE2Items("talismans", league)
 End Function
 
-Public Function getPOE2Essences(Optional ByVal league As String = "Runes of Aldur") As Variant
+Public Function getPOE2Essences(Optional ByVal league As String = "") As Variant
     getPOE2Essences = getPOE2Items("essences", league)
 End Function
 
-Public Function getPOE2Accessories(Optional ByVal league As String = "Runes of Aldur") As Variant
+Public Function getPOE2Accessories(Optional ByVal league As String = "") As Variant
     getPOE2Accessories = getPOE2Items("accessory", league)
 End Function
 
-Public Function getPOE2Armour(Optional ByVal league As String = "Runes of Aldur") As Variant
+Public Function getPOE2Armour(Optional ByVal league As String = "") As Variant
     getPOE2Armour = getPOE2Items("armour", league)
 End Function
 
-Public Function getPOE2Weapons(Optional ByVal league As String = "Runes of Aldur") As Variant
+Public Function getPOE2Weapons(Optional ByVal league As String = "") As Variant
     getPOE2Weapons = getPOE2Items("weapon", league)
 End Function
 
@@ -312,6 +319,8 @@ End Sub
 ' Fetches the full aggregated item list (currency + uniques) for a league.
 Private Function FetchPOE2Data(ByVal league As String) As Collection
     On Error GoTo ErrorHandler
+
+    If Trim(league) = "" Then league = GetActiveLeague()
 
     ' Check cache
     If Not cachedData Is Nothing Then
@@ -832,10 +841,48 @@ End Function
 ' PUBLIC UTILITIES
 '*******************************************************************************
 
+' Returns the name of the currently active league, fetching it from the API
+' if not already cached. Result is cached for 60 minutes.
+Public Function GetActiveLeague() As String
+    On Error GoTo Fallback
+
+    If cachedActiveleague <> "" Then
+        If DateDiff("n", activeLeagueTimestamp, Now) < LEAGUE_CACHE_MINUTES Then
+            GetActiveLeague = cachedActiveleague
+            Exit Function
+        End If
+    End If
+
+    Dim raw As String
+    raw = HttpGetWithRetry("https://poe2scout.com/api/poe2/Leagues")
+
+    If Len(raw) = 0 Then GoTo Fallback
+
+    ' Response is an array of league objects. Try common field spellings.
+    Dim leagueName As String
+    leagueName = ExtractJSONValue(raw, "name,leagueName,league_name,title")
+
+    If leagueName = "" Then GoTo Fallback
+
+    cachedActiveleague = leagueName
+    activeLeagueTimestamp = Now
+    GetActiveLeague = leagueName
+    Exit Function
+
+Fallback:
+    If cachedActiveleague <> "" Then
+        GetActiveLeague = cachedActiveleague
+    Else
+        GetActiveLeague = "Runes of Aldur"
+    End If
+End Function
+
 Public Sub ClearCache()
     Set cachedData = Nothing
     cacheLeague = ""
     cacheTimestamp = 0
+    cachedActiveleague = ""
+    activeLeagueTimestamp = 0
     Debug.Print "Cache cleared at " & Now
 End Sub
 
@@ -843,7 +890,7 @@ End Sub
 ' actual JSON field names can be confirmed.
 Public Sub DumpRawResponse()
     Dim url As String
-    url = API_BASE & URLEncode("Runes of Aldur") & "/Items"
+    url = API_BASE & URLEncode(GetActiveLeague()) & "/Items"
 
     Dim raw As String
     raw = HttpGetWithRetry(url)
@@ -856,11 +903,13 @@ Public Sub DumpRawResponse()
 End Sub
 
 Public Sub TestAPIConnection()
-    Debug.Print "Testing API connection (v3.2.0)..."
+    Debug.Print "Testing API connection (v3.3.0)..."
     ClearCache
 
+    Debug.Print "Active league: " & GetActiveLeague()
+
     Dim data As Collection
-    Set data = FetchPOE2Data("Runes of Aldur")
+    Set data = FetchPOE2Data("")
 
     If data Is Nothing Then
         Debug.Print "FAILED: Could not fetch data"
