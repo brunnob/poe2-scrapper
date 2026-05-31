@@ -612,22 +612,26 @@ Private Function FindItem(ByVal items As Collection, ByVal itemName As String) A
     Dim i As Long
     Dim item As Object
     Dim itemText As String
+    Dim itemNm As String
 
-    ' Exact match first
+    ' Exact match on text or name
     For i = 1 To items.Count
         Set item = items(i)
         itemText = LCase(GetDictValue(item, "text", ""))
-        If itemText = itemNameLower Then
+        itemNm = LCase(GetDictValue(item, "name", ""))
+        If itemText = itemNameLower Or itemNm = itemNameLower Then
             Set FindItem = item
             Exit Function
         End If
     Next i
 
-    ' Partial match
+    ' Partial match on text or name
     For i = 1 To items.Count
         Set item = items(i)
         itemText = LCase(GetDictValue(item, "text", ""))
-        If InStr(itemText, itemNameLower) > 0 Then
+        itemNm = LCase(GetDictValue(item, "name", ""))
+        If (Len(itemText) > 0 And InStr(itemText, itemNameLower) > 0) Or _
+           (Len(itemNm) > 0 And InStr(itemNm, itemNameLower) > 0) Then
             Set FindItem = item
             Exit Function
         End If
@@ -798,6 +802,18 @@ Public Sub TestAPIConnection()
         Debug.Print "ParseNumberFromJSON(""1.0"") = " & ParseNumberFromJSON("1.0")
         Debug.Print "ParseNumberFromJSON(""26.73"") = " & ParseNumberFromJSON("26.73")
         Debug.Print "ParseNumberFromJSON(""3293.27"") = " & ParseNumberFromJSON("3293.27")
+
+        Debug.Print "--- First 10 items (text | name | category | price) ---"
+        Dim n As Long
+        Dim it As Object
+        For n = 1 To Application.Min(10, data.Count)
+            Set it = data(n)
+            Debug.Print n & ": [" & GetDictValue(it, "text", "") & "] | [" & _
+                       GetDictValue(it, "name", "") & "] | [" & _
+                       GetDictValue(it, "category_api_id", "") & "] | " & _
+                       GetDictValue(it, "current_price", "")
+        Next n
+        Debug.Print "-------------------------------------------------------"
 
         Debug.Print "Testing price for Exalted Orb..."
         Dim testPrice As Variant
