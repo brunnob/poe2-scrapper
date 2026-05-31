@@ -1,38 +1,29 @@
 '*******************************************************************************
 ' POE2 Scout Price Scraper for Excel
-' Version: 3.0.1
+' Version: 3.1.0
 ' Description: Fetch real-time POE2 item prices with auto-refresh support
 ' Author: POE2 Community
 ' License: MIT
 ' Data Source: https://poe2scout.com
 '
-' NEW IN v3.0.1:
-' - Fixed base URL to api.poe2scout.com (canonical, avoids legacy proxy)
-' - Added retry logic with backoff for HTTP 429 (rate limit)
-' - Added small delay between page requests to respect rate limits
-'
-' NEW IN v3.0:
-' - Migrated to new API structure: /poe2/Leagues/{league}/...
-' - League is now a URL path segment (was a query param)
-' - API response is a pagination envelope: {Items:[...], Pages:N, CurrentPage:N}
-' - Field names are PascalCase: Text, CurrentPrice, CategoryApiId, PriceLogs
-' - Two separate endpoints: Currencies/ByCategory and Uniques/ByCategory
-' - Full automatic pagination support
-' - Two independent caches: currency items and unique items
+' NEW IN v3.1 (correct API mapping):
+' - Correct endpoint: /api/poe2/Leagues/{league}/Items (single aggregated list)
+' - No pagination, no Page/PerPage params (these caused HTTP 422)
+' - Response is a plain JSON array (not a paginated envelope)
+' - Field names are snake_case: text, current_price, category_api_id,
+'   name, type, api_id, icon_url, item_id
+' - Categories endpoint: /api/poe2/Leagues/{league}/Items/Categories
+' - Retry with backoff on HTTP 429 (rate limit)
 ' - All public function signatures preserved
 '*******************************************************************************
 
 Option Explicit
 
-Private cachedCurrencyData As Collection
-Private cachedUniqueData As Collection
-Private cacheCurrencyLeague As String
-Private cacheUniqueLeague As String
-Private cacheCurrencyTime As Date
-Private cacheUniqueTime As Date
+Private cachedData As Collection
+Private cacheLeague As String
+Private cacheTimestamp As Date
 Private Const CACHE_DURATION_MINUTES As Integer = 5
-Private Const PER_PAGE As Integer = 100
-Private Const API_BASE As String = "https://api.poe2scout.com/poe2/Leagues/"
+Private Const API_BASE As String = "https://poe2scout.com/api/poe2/Leagues/"
 
 '*******************************************************************************
 ' PUBLIC FUNCTIONS
@@ -48,8 +39,16 @@ Public Function getPOE2Price(ByVal itemName As String, _
         Exit Function
     End If
 
+    Dim data As Collection
+    Set data = FetchPOE2Data(league)
+
+    If data Is Nothing Then
+        getPOE2Price = "Error: Failed to fetch data from API"
+        Exit Function
+    End If
+
     Dim items As Collection
-    Set items = FetchAndFilter(league, category)
+    Set items = FilterByCategory(data, category)
 
     Dim foundItem As Object
     Set foundItem = FindItem(items, itemName)
@@ -58,7 +57,7 @@ Public Function getPOE2Price(ByVal itemName As String, _
         getPOE2Price = "Error: Item '" & itemName & "' not found"
     Else
         On Error Resume Next
-        getPOE2Price = ParseNumberFromJSON(GetDictValue(foundItem, "CurrentPrice", "0"))
+        getPOE2Price = ParseNumberFromJSON(GetDictValue(foundItem, "current_price", "0"))
         If Err.Number <> 0 Then getPOE2Price = "Error: Invalid price data"
         On Error GoTo ErrorHandler
     End If
@@ -77,8 +76,16 @@ Public Function getPOE2ItemDetails(ByVal itemName As String, _
         Exit Function
     End If
 
+    Dim data As Collection
+    Set data = FetchPOE2Data(league)
+
+    If data Is Nothing Then
+        getPOE2ItemDetails = Array("Error", "Failed to fetch data", "", "")
+        Exit Function
+    End If
+
     Dim items As Collection
-    Set items = FetchAndFilter(league, category)
+    Set items = FilterByCategory(data, category)
 
     Dim foundItem As Object
     Set foundItem = FindItem(items, itemName)
@@ -87,10 +94,10 @@ Public Function getPOE2ItemDetails(ByVal itemName As String, _
         getPOE2ItemDetails = Array("Error", "Item not found", "", "")
     Else
         Dim result(0 To 3) As Variant
-        result(0) = GetDictValue(foundItem, "Text", "Unknown")
-        result(1) = ParseNumberFromJSON(GetDictValue(foundItem, "CurrentPrice", "0"))
+        result(0) = GetDictValue(foundItem, "text", "Unknown")
+        result(1) = ParseNumberFromJSON(GetDictValue(foundItem, "current_price", "0"))
         result(2) = GetQuantity(foundItem)
-        result(3) = GetDictValue(foundItem, "CategoryApiId", "Unknown")
+        result(3) = GetDictValue(foundItem, "category_api_id", "Unknown")
         getPOE2ItemDetails = result
     End If
     Exit Function
@@ -102,10 +109,18 @@ Public Function getPOE2Items(Optional ByVal category As String = "", _
                              Optional ByVal league As String = "Fate of the Vaal") As Variant
     On Error GoTo ErrorHandler
 
-    Dim items As Collection
-    Set items = FetchAndFilter(league, category)
+    Dim data As Collection
+    Set data = FetchPOE2Data(league)
 
-    If items Is Nothing Or items.Count = 0 Then
+    If data Is Nothing Then
+        getPOE2Items = Array(Array("Error", "Failed to fetch data", "", ""))
+        Exit Function
+    End If
+
+    Dim items As Collection
+    Set items = FilterByCategory(data, category)
+
+    If items.Count = 0 Then
         getPOE2Items = Array(Array("Error", "No items found", "", ""))
         Exit Function
     End If
@@ -125,10 +140,10 @@ Public Function getPOE2Items(Optional ByVal category As String = "", _
     Dim item As Object
     For i = 1 To sortedItems.Count
         Set item = sortedItems(i)
-        result(i, 0) = GetDictValue(item, "Text", "Unknown")
-        result(i, 1) = ParseNumberFromJSON(GetDictValue(item, "CurrentPrice", "0"))
+        result(i, 0) = GetDictValue(item, "text", "Unknown")
+        result(i, 1) = ParseNumberFromJSON(GetDictValue(item, "current_price", "0"))
         result(i, 2) = GetQuantity(item)
-        result(i, 3) = GetDictValue(item, "CategoryApiId", "Unknown")
+        result(i, 3) = GetDictValue(item, "category_api_id", "Unknown")
     Next i
 
     getPOE2Items = result
@@ -140,8 +155,13 @@ End Function
 Public Function getPOE2Categories(Optional ByVal league As String = "Fate of the Vaal") As Variant
     On Error GoTo ErrorHandler
 
-    Dim allItems As Collection
-    Set allItems = FetchAllItems(league)
+    Dim data As Collection
+    Set data = FetchPOE2Data(league)
+
+    If data Is Nothing Then
+        getPOE2Categories = Array(Array("Error", "Failed to fetch data"))
+        Exit Function
+    End If
 
     Dim categoryCounts As Object
     Set categoryCounts = CreateObject("Scripting.Dictionary")
@@ -150,9 +170,9 @@ Public Function getPOE2Categories(Optional ByVal league As String = "Fate of the
     Dim item As Object
     Dim cat As String
 
-    For i = 1 To allItems.Count
-        Set item = allItems(i)
-        cat = GetDictValue(item, "CategoryApiId", "unknown")
+    For i = 1 To data.Count
+        Set item = data(i)
+        cat = GetDictValue(item, "category_api_id", "unknown")
         If categoryCounts.Exists(cat) Then
             categoryCounts(cat) = categoryCounts(cat) + 1
         Else
@@ -284,143 +304,48 @@ End Sub
 ' CORE DATA FETCHING (PRIVATE)
 '*******************************************************************************
 
-Private Function FetchAndFilter(ByVal league As String, ByVal category As String) As Collection
-    Dim all As Collection
-
-    If Trim(category) = "" Then
-        Set all = FetchAllItems(league)
-    ElseIf IsCurrencyCategory(category) Then
-        Set all = FetchCurrencyItems(league)
-    Else
-        Set all = FetchUniqueItems(league)
-    End If
-
-    Set FetchAndFilter = FilterByCategory(all, category)
-End Function
-
-Private Function FetchAllItems(ByVal league As String) As Collection
-    Dim result As Collection
-    Set result = New Collection
-
-    Dim curr As Collection
-    Set curr = FetchCurrencyItems(league)
-
-    Dim uniq As Collection
-    Set uniq = FetchUniqueItems(league)
-
-    Dim i As Long
-    For i = 1 To curr.Count
-        result.Add curr(i)
-    Next i
-    For i = 1 To uniq.Count
-        result.Add uniq(i)
-    Next i
-
-    Set FetchAllItems = result
-End Function
-
-Private Function FetchCurrencyItems(ByVal league As String) As Collection
-    If Not cachedCurrencyData Is Nothing Then
-        If cacheCurrencyLeague = league Then
-            If DateDiff("n", cacheCurrencyTime, Now) < CACHE_DURATION_MINUTES Then
-                Set FetchCurrencyItems = cachedCurrencyData
-                Exit Function
-            End If
-        End If
-    End If
-
-    Dim url As String
-    url = API_BASE & URLEncode(league) & "/Currencies/ByCategory"
-
-    Dim result As Collection
-    Set result = FetchAllPages(url)
-    If result Is Nothing Then Set result = New Collection
-
-    Set cachedCurrencyData = result
-    cacheCurrencyLeague = league
-    cacheCurrencyTime = Now
-
-    Set FetchCurrencyItems = result
-End Function
-
-Private Function FetchUniqueItems(ByVal league As String) As Collection
-    If Not cachedUniqueData Is Nothing Then
-        If cacheUniqueLeague = league Then
-            If DateDiff("n", cacheUniqueTime, Now) < CACHE_DURATION_MINUTES Then
-                Set FetchUniqueItems = cachedUniqueData
-                Exit Function
-            End If
-        End If
-    End If
-
-    Dim url As String
-    url = API_BASE & URLEncode(league) & "/Uniques/ByCategory"
-
-    Dim result As Collection
-    Set result = FetchAllPages(url)
-    If result Is Nothing Then Set result = New Collection
-
-    Set cachedUniqueData = result
-    cacheUniqueLeague = league
-    cacheUniqueTime = Now
-
-    Set FetchUniqueItems = result
-End Function
-
-' Fetches all pages with retry on 429 and a small delay between pages.
-Private Function FetchAllPages(ByVal baseUrl As String) As Collection
+' Fetches the full aggregated item list (currency + uniques) for a league.
+Private Function FetchPOE2Data(ByVal league As String) As Collection
     On Error GoTo ErrorHandler
 
-    Dim result As Collection
-    Set result = New Collection
-
-    Dim page As Long
-    Dim totalPages As Long
-    page = 1
-    totalPages = 1
-
-    Do While page <= totalPages
-        Dim pageUrl As String
-        pageUrl = baseUrl & "?Page=" & page & "&PerPage=" & PER_PAGE
-
-        Dim responseText As String
-        responseText = HttpGetWithRetry(pageUrl)
-        If Len(responseText) = 0 Then Exit Do
-
-        Dim parsedPages As Long
-        Dim pageItems As Collection
-        Set pageItems = ParseEnvelopeResponse(responseText, parsedPages)
-
-        If page = 1 Then
-            totalPages = parsedPages
-            If totalPages < 1 Then totalPages = 1
+    ' Check cache
+    If Not cachedData Is Nothing Then
+        If cacheLeague = league Then
+            If DateDiff("n", cacheTimestamp, Now) < CACHE_DURATION_MINUTES Then
+                Set FetchPOE2Data = cachedData
+                Exit Function
+            End If
         End If
+    End If
 
-        If Not pageItems Is Nothing Then
-            Dim i As Long
-            For i = 1 To pageItems.Count
-                result.Add pageItems(i)
-            Next i
-        End If
+    Dim url As String
+    url = API_BASE & URLEncode(league) & "/Items"
 
-        page = page + 1
-        If page > 50 Then Exit Do  ' safety cap
+    Dim responseText As String
+    responseText = HttpGetWithRetry(url)
 
-        ' Brief pause between pages to respect rate limits
-        If page <= totalPages Then
-            Dim waitUntil As Date
-            waitUntil = Now + TimeSerial(0, 0, 1)
-            Do While Now < waitUntil
-                DoEvents
-            Loop
-        End If
-    Loop
+    If Len(responseText) = 0 Then
+        Set FetchPOE2Data = Nothing
+        Exit Function
+    End If
 
-    Set FetchAllPages = result
+    Dim parsed As Collection
+    Set parsed = ParseJSONResponse(responseText)
+
+    If parsed Is Nothing Then
+        Set FetchPOE2Data = Nothing
+        Exit Function
+    End If
+
+    Set cachedData = parsed
+    cacheLeague = league
+    cacheTimestamp = Now
+
+    Set FetchPOE2Data = parsed
     Exit Function
 ErrorHandler:
-    Debug.Print "FetchAllPages Error: " & Err.Description
-    Set FetchAllPages = result
+    Debug.Print "FetchPOE2Data Error: " & Err.Description & " (Code: " & Err.Number & ")"
+    Set FetchPOE2Data = Nothing
 End Function
 
 ' Makes an HTTP GET request with up to 3 retries on HTTP 429 (rate limit).
@@ -438,16 +363,10 @@ Private Function HttpGetWithRetry(ByVal url As String) As String
                 HttpGetWithRetry = response
                 Exit Function
             Case 429
-                ' Rate limited — wait and retry
                 waitSeconds = attempt * 3  ' 3s, 6s, 9s
-                Debug.Print "HTTP 429 on attempt " & attempt & ", waiting " & waitSeconds & "s before retry..."
-                Dim waitUntil As Date
-                waitUntil = Now + TimeSerial(0, 0, waitSeconds)
-                Do While Now < waitUntil
-                    DoEvents
-                Loop
+                Debug.Print "HTTP 429 on attempt " & attempt & ", waiting " & waitSeconds & "s..."
+                WaitSecs waitSeconds
             Case 0
-                ' Network error — stop retrying
                 HttpGetWithRetry = ""
                 Exit Function
             Case Else
@@ -469,7 +388,7 @@ Private Function HttpGetRaw(ByVal url As String, ByRef responseBody As String) A
     Set http = CreateObject("MSXML2.ServerXMLHTTP.6.0")
 
     http.Open "GET", url, False
-    http.setRequestHeader "User-Agent", "POE2-Excel-Scraper/3.0"
+    http.setRequestHeader "User-Agent", "POE2-Excel-Scraper/3.1 (contact: excel-addin)"
     http.setRequestHeader "Accept", "application/json"
     http.Send
 
@@ -482,42 +401,39 @@ ErrorHandler:
     responseBody = ""
 End Function
 
-' Parses {Items:[...], Pages:N} envelope. outPages receives the total page count.
-Private Function ParseEnvelopeResponse(ByVal jsonText As String, ByRef outPages As Long) As Collection
-    On Error GoTo TryFallback
+Private Sub WaitSecs(ByVal secs As Integer)
+    Dim waitUntil As Date
+    waitUntil = Now + TimeSerial(0, 0, secs)
+    Do While Now < waitUntil
+        DoEvents
+    Loop
+End Sub
 
-    outPages = 1
+' Parses a plain JSON array of item objects.
+Private Function ParseJSONResponse(ByVal jsonText As String) As Collection
+    On Error GoTo TryFallback
 
     Dim sc As Object
     Set sc = CreateObject("MSScriptControl.ScriptControl")
     sc.Language = "JScript"
 
-    Dim jsObj As Object
-    Set jsObj = sc.Eval("(" & jsonText & ")")
-
-    On Error Resume Next
-    outPages = CLng(jsObj.Pages)
-    If Err.Number <> 0 Or outPages < 1 Then outPages = 1
-    Err.Clear
-    On Error GoTo TryFallback
-
-    Dim jsItems As Object
-    Set jsItems = jsObj.Items
+    Dim jsArray As Object
+    Set jsArray = sc.Eval("(" & jsonText & ")")
 
     Dim result As Collection
     Set result = New Collection
 
     Dim i As Long
-    For i = 0 To jsItems.length - 1
-        result.Add ConvertJSObject(jsItems(i))
+    For i = 0 To jsArray.length - 1
+        result.Add ConvertJSObject(jsArray(i))
     Next i
 
-    Set ParseEnvelopeResponse = result
+    Set ParseJSONResponse = result
     Exit Function
 
 TryFallback:
     Debug.Print "ScriptControl failed, using fallback parser"
-    Set ParseEnvelopeResponse = ParseEnvelopeFallback(jsonText, outPages)
+    Set ParseJSONResponse = ParseJSONAlternative(jsonText)
 End Function
 
 Private Function ConvertJSObject(ByVal jsObj As Object) As Object
@@ -525,87 +441,24 @@ Private Function ConvertJSObject(ByVal jsObj As Object) As Object
     Set dict = CreateObject("Scripting.Dictionary")
 
     On Error Resume Next
-    dict.Add "Text", CStr(jsObj.Text)
-    dict.Add "CurrentPrice", CStr(jsObj.CurrentPrice)
-    dict.Add "CategoryApiId", CStr(jsObj.CategoryApiId)
-    dict.Add "ApiId", CStr(jsObj.ApiId)
-    dict.Add "IconUrl", CStr(jsObj.IconUrl)
-    dict.Add "CurrentQuantity", CStr(jsObj.CurrentQuantity)
-    dict.Add "PriceLogs", jsObj.PriceLogs
+    dict.Add "item_id", CStr(jsObj.item_id)
+    dict.Add "api_id", CStr(jsObj.api_id)
+    dict.Add "text", CStr(jsObj.text)
+    dict.Add "name", CStr(jsObj.name)
+    dict.Add "type", CStr(jsObj.type)
+    dict.Add "category_api_id", CStr(jsObj.category_api_id)
+    dict.Add "current_price", CStr(jsObj.current_price)
+    dict.Add "icon_url", CStr(jsObj.icon_url)
     On Error GoTo 0
 
     Set ConvertJSObject = dict
 End Function
 
 '*******************************************************************************
-' FALLBACK JSON PARSER (PRIVATE)
+' FALLBACK JSON PARSER (PRIVATE) - used if MSScriptControl is unavailable
 '*******************************************************************************
 
-Private Function ParseEnvelopeFallback(ByVal jsonText As String, ByRef outPages As Long) As Collection
-    On Error GoTo ErrorHandler
-
-    outPages = 1
-
-    Dim pagesStr As String
-    pagesStr = ExtractJSONValue(jsonText, "Pages")
-    If IsNumeric(pagesStr) And pagesStr <> "" Then outPages = CLng(pagesStr)
-
-    Dim itemsKeyPos As Long
-    itemsKeyPos = InStr(jsonText, """Items"":")
-    If itemsKeyPos = 0 Then itemsKeyPos = InStr(jsonText, """items"":")
-
-    If itemsKeyPos = 0 Then
-        If Left(Trim(jsonText), 1) = "[" Then
-            Set ParseEnvelopeFallback = ParseBareArray(jsonText)
-        Else
-            Set ParseEnvelopeFallback = New Collection
-        End If
-        Exit Function
-    End If
-
-    Dim arrStart As Long
-    arrStart = InStr(itemsKeyPos, jsonText, "[")
-    If arrStart = 0 Then
-        Set ParseEnvelopeFallback = New Collection
-        Exit Function
-    End If
-
-    Dim depth As Long
-    Dim arrEnd As Long
-    Dim i As Long
-    Dim insideStr As Boolean
-    Dim prevCh As String
-    depth = 0
-    insideStr = False
-    prevCh = ""
-
-    For i = arrStart To Len(jsonText)
-        Dim ch As String
-        ch = Mid(jsonText, i, 1)
-        If ch = """" And prevCh <> "\" Then insideStr = Not insideStr
-        If Not insideStr Then
-            If ch = "[" Then depth = depth + 1
-            If ch = "]" Then
-                depth = depth - 1
-                If depth = 0 Then arrEnd = i: Exit For
-            End If
-        End If
-        prevCh = ch
-    Next i
-
-    If arrEnd = 0 Then
-        Set ParseEnvelopeFallback = New Collection
-        Exit Function
-    End If
-
-    Set ParseEnvelopeFallback = ParseBareArray(Mid(jsonText, arrStart, arrEnd - arrStart + 1))
-    Exit Function
-ErrorHandler:
-    Debug.Print "ParseEnvelopeFallback Error: " & Err.Description
-    Set ParseEnvelopeFallback = New Collection
-End Function
-
-Private Function ParseBareArray(ByVal jsonText As String) As Collection
+Private Function ParseJSONAlternative(ByVal jsonText As String) As Collection
     Dim result As Collection
     Set result = New Collection
 
@@ -623,7 +476,7 @@ Private Function ParseBareArray(ByVal jsonText As String) As Collection
         If Not item Is Nothing Then result.Add item
     Next i
 
-    Set ParseBareArray = result
+    Set ParseJSONAlternative = result
 End Function
 
 Private Function SplitJSONObjects(ByVal jsonText As String) As String()
@@ -668,11 +521,13 @@ Private Function ParseJSONObject(ByVal jsonText As String) As Object
     Dim dict As Object
     Set dict = CreateObject("Scripting.Dictionary")
 
-    dict.Add "Text", ExtractJSONValue(jsonText, "Text")
-    dict.Add "CurrentPrice", ExtractJSONValue(jsonText, "CurrentPrice")
-    dict.Add "CategoryApiId", ExtractJSONValue(jsonText, "CategoryApiId")
-    dict.Add "ApiId", ExtractJSONValue(jsonText, "ApiId")
-    dict.Add "CurrentQuantity", ExtractJSONValue(jsonText, "CurrentQuantity")
+    dict.Add "text", ExtractJSONValue(jsonText, "text")
+    dict.Add "current_price", ExtractJSONValue(jsonText, "current_price")
+    dict.Add "category_api_id", ExtractJSONValue(jsonText, "category_api_id")
+    dict.Add "name", ExtractJSONValue(jsonText, "name")
+    dict.Add "type", ExtractJSONValue(jsonText, "type")
+    dict.Add "api_id", ExtractJSONValue(jsonText, "api_id")
+    dict.Add "item_id", ExtractJSONValue(jsonText, "item_id")
 
     If Err.Number <> 0 Then
         Set ParseJSONObject = Nothing
@@ -722,17 +577,6 @@ End Function
 ' UTILITY FUNCTIONS (PRIVATE)
 '*******************************************************************************
 
-Private Function IsCurrencyCategory(ByVal category As String) As Boolean
-    Select Case LCase(Trim(category))
-        Case "currency", "fragments", "runes", "talismans", "essences", _
-             "catalysts", "oils", "incubators", "scarabs", "delirium", _
-             "breach", "expedition", "ritual", "ultimatum"
-            IsCurrencyCategory = True
-        Case Else
-            IsCurrencyCategory = False
-    End Select
-End Function
-
 Private Function URLEncode(ByVal text As String) As String
     URLEncode = Replace(text, " ", "%20")
     URLEncode = Replace(URLEncode, "&", "%26")
@@ -752,7 +596,7 @@ Private Function FilterByCategory(ByVal data As Collection, ByVal category As St
         Dim item As Object
         For i = 1 To data.Count
             Set item = data(i)
-            If LCase(GetDictValue(item, "CategoryApiId", "")) = LCase(Trim(category)) Then
+            If LCase(GetDictValue(item, "category_api_id", "")) = LCase(Trim(category)) Then
                 filtered.Add item
             End If
         Next i
@@ -769,18 +613,20 @@ Private Function FindItem(ByVal items As Collection, ByVal itemName As String) A
     Dim item As Object
     Dim itemText As String
 
+    ' Exact match first
     For i = 1 To items.Count
         Set item = items(i)
-        itemText = LCase(GetDictValue(item, "Text", ""))
+        itemText = LCase(GetDictValue(item, "text", ""))
         If itemText = itemNameLower Then
             Set FindItem = item
             Exit Function
         End If
     Next i
 
+    ' Partial match
     For i = 1 To items.Count
         Set item = items(i)
-        itemText = LCase(GetDictValue(item, "Text", ""))
+        itemText = LCase(GetDictValue(item, "text", ""))
         If InStr(itemText, itemNameLower) > 0 Then
             Set FindItem = item
             Exit Function
@@ -815,8 +661,8 @@ Private Function SortByPrice(ByVal items As Collection) As Collection
     For i = 1 To UBound(arr) - 1
         swapped = False
         For j = 1 To UBound(arr) - i
-            price1 = ParseNumberFromJSON(GetDictValue(arr(j), "CurrentPrice", "0"))
-            price2 = ParseNumberFromJSON(GetDictValue(arr(j + 1), "CurrentPrice", "0"))
+            price1 = ParseNumberFromJSON(GetDictValue(arr(j), "current_price", "0"))
+            price2 = ParseNumberFromJSON(GetDictValue(arr(j + 1), "current_price", "0"))
             If price1 < price2 Then
                 Set temp = arr(j)
                 Set arr(j) = arr(j + 1)
@@ -848,29 +694,15 @@ Private Function GetDictValue(ByVal dict As Object, ByVal key As String, ByVal d
     On Error GoTo 0
 End Function
 
+' The aggregated /Items endpoint does not expose quantity, so this returns N/A.
 Private Function GetQuantity(ByVal item As Object) As Variant
     On Error Resume Next
-
     Dim qty As Variant
-    qty = GetDictValue(item, "CurrentQuantity", "")
+    qty = GetDictValue(item, "current_quantity", "")
     If qty <> "" And IsNumeric(qty) And CDbl(qty) > 0 Then
         GetQuantity = CDbl(qty)
         Exit Function
     End If
-
-    Dim priceLogs As Object
-    Set priceLogs = item("PriceLogs")
-    If Not priceLogs Is Nothing Then
-        If priceLogs.length > 0 Then
-            Dim latestLog As Object
-            Set latestLog = priceLogs(0)
-            If Not latestLog Is Nothing Then
-                GetQuantity = latestLog("Quantity")
-                Exit Function
-            End If
-        End If
-    End If
-
     GetQuantity = "N/A"
     On Error GoTo 0
 End Function
@@ -944,37 +776,32 @@ End Function
 '*******************************************************************************
 
 Public Sub ClearCache()
-    Set cachedCurrencyData = Nothing
-    Set cachedUniqueData = Nothing
-    cacheCurrencyLeague = ""
-    cacheUniqueLeague = ""
-    cacheCurrencyTime = 0
-    cacheUniqueTime = 0
+    Set cachedData = Nothing
+    cacheLeague = ""
+    cacheTimestamp = 0
     Debug.Print "Cache cleared at " & Now
 End Sub
 
 Public Sub TestAPIConnection()
-    Debug.Print "Testing API connection (v3.0.1)..."
+    Debug.Print "Testing API connection (v3.1.0)..."
     ClearCache
 
-    Dim currencies As Collection
-    Set currencies = FetchCurrencyItems("Fate of the Vaal")
-    If currencies Is Nothing Or currencies.Count = 0 Then
-        Debug.Print "FAILED: Could not fetch currency data"
-    Else
-        Debug.Print "SUCCESS: Fetched " & currencies.Count & " currency items"
-    End If
+    Dim data As Collection
+    Set data = FetchPOE2Data("Fate of the Vaal")
 
-    Dim uniques As Collection
-    Set uniques = FetchUniqueItems("Fate of the Vaal")
-    If uniques Is Nothing Or uniques.Count = 0 Then
-        Debug.Print "WARNING: No unique items fetched"
+    If data Is Nothing Then
+        Debug.Print "FAILED: Could not fetch data"
     Else
-        Debug.Print "SUCCESS: Fetched " & uniques.Count & " unique items"
-    End If
+        Debug.Print "SUCCESS: Fetched " & data.Count & " items"
 
-    Debug.Print "Testing getPOE2Price for Exalted Orb..."
-    Dim testPrice As Variant
-    testPrice = getPOE2Price("Exalted Orb", "currency")
-    Debug.Print "Exalted Orb price: " & testPrice
+        Debug.Print "Testing number parsing..."
+        Debug.Print "ParseNumberFromJSON(""1.0"") = " & ParseNumberFromJSON("1.0")
+        Debug.Print "ParseNumberFromJSON(""26.73"") = " & ParseNumberFromJSON("26.73")
+        Debug.Print "ParseNumberFromJSON(""3293.27"") = " & ParseNumberFromJSON("3293.27")
+
+        Debug.Print "Testing price for Exalted Orb..."
+        Dim testPrice As Variant
+        testPrice = getPOE2Price("Exalted Orb")
+        Debug.Print "Exalted Orb price: " & testPrice
+    End If
 End Sub
